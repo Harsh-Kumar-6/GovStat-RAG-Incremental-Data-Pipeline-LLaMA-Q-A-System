@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mospi_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.api
+    container_name: mospi_api
+    env_file: .env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - ./data:/app/data
+      - ./datasets:/app/datasets
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: uvicorn rag.api:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.ui
+    container_name: mospi_ui
+    env_file: .env
+    environment:
+      - API_URL=http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    command: streamlit run rag/ui.py --server.port 8501 --server.address 0.0.0.0
+    restart: unless-stopped
+
+  scraper:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.scraper
+    container_name: mospi_scraper
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./datasets:/app/datasets
+    profiles:
+      - scraper
+    command: python -m scraper crawl
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.scraper
+    container_name: mospi_pipeline
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./datasets:/app/datasets
+    profiles:
+      - pipeline
+    command: python -m pipeline.run
+
+volumes:
+  ollama_data:
