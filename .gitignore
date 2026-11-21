@@ -49,6 +49,7 @@ data/index/
 data/*.parquet
 data/*.csv
 data/*.json
+datasets/catalog.json
 
 # ----------------------
 # Vector index (FAISS / Chroma)
@@ -98,3 +99,8 @@ htmlcov/
 *.bak
 *.tmp
 *.cache
+# ----------------------
+# Local working notes
+# ----------------------
+# Personal concepts/learning log, kept out of the public repo.
+docs/explanation.md

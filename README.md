@@ -43,7 +43,7 @@ mospi-rag/
 ├── scraper/           # Web scraping & PDF parsing
 │   ├── config.py      # Pydantic settings (reads .env)
 │   ├── db.py          # SQLite schema + context manager
-│   ├── crawl.py       # Listing + detail page crawler
+│   ├── crawl.py       # MoSPI JSON listing API client (the site is a SPA)
 │   ├── parse.py       # PDF downloader + pdfplumber extractor
 │   ├── logger.py      # structlog JSON logger
 │   └── __main__.py    # CLI entry points
@@ -59,10 +59,16 @@ mospi-rag/
 │   ├── Dockerfile.scraper
 │   ├── Dockerfile.api
 │   └── Dockerfile.ui
-├── tests/
-│   ├── test_scraper.py     # Unit: HTML parser, date normalizer
-│   ├── test_etl.py         # Unit: chunker, validator
-│   └── test_integration.py # Integration: mock HTTP server → crawl → DB
+├── tests/              # 91 tests — pytest
+│   ├── conftest.py            # DB + PDF fixtures
+│   ├── test_crawl.py          # API client, categories, idempotency
+│   ├── test_parse.py          # PDF guard (HTML-as-200), extraction
+│   ├── test_chunker.py        # Chunk windows, overlap, termination
+│   ├── test_validator.py      # Validation + date normalization
+│   ├── test_db.py             # Schema, migration, read-only connection
+│   └── test_etl_integration.py # DB → chunks, end to end
+├── docs/
+│   └── schema.md       # SQL schema and the reason for each choice
 ├── data/
 │   ├── raw/pdf/       # Downloaded PDFs
 │   └── processed/     # Parquet files + FAISS index
@@ -80,11 +86,13 @@ mospi-rag/
 ## CLI Reference
 
 ```bash
-# Crawl MoSPI listing pages (idempotent — skips unchanged content)
+# Pull MoSPI document listings (idempotent — skips unchanged content).
+# --max-pages caps API listing pages PER SOURCE.
 python -m scraper crawl --max-pages 5
 
-# Override seed URLs
-python -m scraper crawl --seed-url https://mospi.gov.in/web/mospi/press-releases
+# Note: mospi.gov.in is a client-rendered SPA — every path returns the same
+# HTML shell. The scraper calls the site's own public JSON API instead, so
+# --seed-url is accepted but ignored. Configure SOURCES in .env.
 
 # Download PDFs and extract text + tables
 python -m scraper parse

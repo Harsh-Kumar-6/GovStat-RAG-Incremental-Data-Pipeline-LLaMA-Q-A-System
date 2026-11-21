@@ -21,12 +21,30 @@ log = get_logger(__name__)
 # Chunking
 # ---------------------------------------------------------------------------
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-    """Split text into overlapping token-approximate chunks."""
-    if not text.strip():
+def chunk_text(
+    text: str,
+    chunk_size: int = 180,
+    overlap: int = 40,
+    min_words: int = 0,
+) -> List[str]:
+    """Split text into overlapping word-windows.
+
+    `chunk_size` and `overlap` are measured in WORDS. `overlap` must be smaller
+    than `chunk_size`, otherwise the window would never advance and the loop
+    would not terminate; it is clamped rather than trusted.
+
+    A trailing window shorter than `min_words` is merged into the previous
+    chunk instead of being emitted, so the index is not polluted with
+    three-word fragments that match almost any query.
+    """
+    if not text or not text.strip():
         return []
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    overlap = max(0, min(overlap, chunk_size - 1))
+
     words = text.split()
-    chunks = []
+    chunks: List[str] = []
     start = 0
     while start < len(words):
         end = min(start + chunk_size, len(words))
@@ -34,7 +52,28 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[st
         if end == len(words):
             break
         start = end - overlap
+
+    if min_words and len(chunks) > 1 and len(chunks[-1].split()) < min_words:
+        tail = chunks.pop()
+        chunks[-1] = chunks[-1] + " " + tail
     return chunks
+
+
+def get_document_text(conn, doc: Dict[str, Any]) -> tuple[str, str]:
+    """Return (text, source) for a document, preferring real PDF body text.
+
+    Falls back to the listing-page summary when no PDF text was extracted, and
+    labels which one was used so the chunk mix is auditable in SQL:
+        SELECT source, COUNT(*) FROM chunks GROUP BY source;
+    """
+    rows = conn.execute(
+        "SELECT text FROM doc_texts WHERE document_id = ? ORDER BY n_chars DESC",
+        (doc["id"],),
+    ).fetchall()
+    joined = "\n".join(r["text"] for r in rows if r["text"])
+    if joined.strip():
+        return joined, "pdf_text"
+    return (doc.get("summary") or "").strip(), "summary"
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +96,11 @@ def validate_document(row: Dict[str, Any]) -> List[str]:
             date.fromisoformat(str(row["date_published"]))
         except ValueError:
             issues.append(f"invalid_date: {row['date_published']}")
-    if not row.get("summary"):
-        issues.append("summary_empty")
+    # `summary` is deliberately NOT required. It holds listing-page blurb text,
+    # which the MoSPI API does not provide; a document's real content is its
+    # extracted PDF text in `doc_texts`. Requiring a summary here would reject
+    # every genuinely crawled document -- and requiring one is what pushed the
+    # old pipeline into inventing summaries in the first place.
     return issues
 
 
@@ -112,16 +154,24 @@ def run_etl(db_path: Optional[str] = None) -> None:
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM chunks")  # rebuild
         for doc in deduped:
-            text = (doc.get("summary") or "").strip()
+            text, text_source = get_document_text(conn, doc)
             if not text:
+                log.warning("document_no_text", doc_id=doc["id"])
                 continue
-            chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+            chunks = chunk_text(
+                text,
+                settings.chunk_size,
+                settings.chunk_overlap,
+                settings.min_chunk_words,
+            )
             for i, chunk in enumerate(chunks):
                 chunk_id = str(uuid.uuid4())
                 token_count = len(chunk.split())
                 conn.execute(
-                    "INSERT INTO chunks(id, document_id, chunk_index, text, token_count) VALUES (?,?,?,?,?)",
-                    (chunk_id, doc["id"], i, chunk, token_count),
+                    "INSERT INTO chunks"
+                    "(id, document_id, chunk_index, text, token_count, source) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (chunk_id, doc["id"], i, chunk, token_count, text_source),
                 )
                 all_chunks.append({
                     "id": chunk_id,
@@ -129,6 +179,7 @@ def run_etl(db_path: Optional[str] = None) -> None:
                     "chunk_index": i,
                     "text": chunk,
                     "token_count": token_count,
+                    "source": text_source,
                     "title": doc.get("title", ""),
                     "url": doc.get("url", ""),
                     "date_published": doc.get("date_published"),
@@ -148,14 +199,26 @@ def run_etl(db_path: Optional[str] = None) -> None:
         df["year"] = df["date_published"].str[:4]
         by_date = df.groupby("year").size().to_dict()
 
+    # Chunk-source mix is recorded because a run where every chunk came from
+    # "summary" means no PDF body text was indexed -- the failure that made the
+    # earlier catalog read 49 documents -> 49 chunks.
+    chunks_per_doc = (
+        len(all_chunks) / len(deduped) if deduped else 0.0
+    )
+    by_source: Dict[str, int] = {}
+    for c in all_chunks:
+        by_source[c["source"]] = by_source.get(c["source"], 0) + 1
+
     catalog = {
         "total_documents": len(deduped),
         "total_chunks": len(all_chunks),
+        "chunks_per_document": round(chunks_per_doc, 2),
+        "chunks_by_source": by_source,
         "by_category": by_category,
         "by_year": by_date,
         "files": {
-            "documents_parquet": str(parquet_path),
-            "chunks_parquet": str(chunks_path),
+            "documents_parquet": parquet_path.as_posix(),
+            "chunks_parquet": chunks_path.as_posix(),
         },
     }
     catalog_path = Path("datasets") / "catalog.json"
@@ -163,4 +226,15 @@ def run_etl(db_path: Optional[str] = None) -> None:
     catalog_path.write_text(json.dumps(catalog, indent=2))
     log.info("wrote_catalog", path=str(catalog_path))
 
-    log.info("etl_complete", total_chunks=len(all_chunks))
+    log.info(
+        "etl_complete",
+        total_chunks=len(all_chunks),
+        chunks_per_document=round(chunks_per_doc, 2),
+        chunks_by_source=by_source,
+    )
+    if by_source and set(by_source) == {"summary"}:
+        log.warning(
+            "no_pdf_text_indexed",
+            hint="Every chunk came from documents.summary. No PDF body text was "
+                 "extracted -- check `files.fetch_status` and the doc_texts table.",
+        )
