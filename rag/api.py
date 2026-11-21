@@ -1,7 +1,7 @@
 """FastAPI application for the RAG chatbot."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +34,13 @@ class AskRequest(BaseModel):
     k: int = 5
     temperature: float = 0.1
     stream: bool = False
+    # "agents" = supervisor -> sql/rag -> writer -> critic (the Phase 2 graph)
+    # "basic"  = the original single-step RAG: retrieve, stuff, answer.
+    # The basic path is kept deliberately. It is the baseline the Phase 3 eval
+    # compares against, and a comparison needs the old system still running,
+    # not a description of it.
+    mode: Literal["agents", "basic"] = "agents"
+    with_critic: bool = True
 
 
 class Citation(BaseModel):
@@ -46,6 +53,21 @@ class Citation(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     citations: List[Citation]
+    # Everything below is null in basic mode, which is itself informative:
+    # the old path cannot tell you why it answered the way it did.
+    mode: str = "basic"
+    route: Optional[List[str]] = None
+    route_reason: Optional[str] = None
+    agent_path: Optional[List[str]] = None
+    sql_query: Optional[str] = None
+    sql_row_count: Optional[int] = None
+    sql_attempts: Optional[int] = None
+    revisions: Optional[int] = None
+    critic_verdict: Optional[str] = None
+    critique: Optional[str] = None
+    trace_id: Optional[str] = None
+    duration_ms: Optional[float] = None
+    usage: Optional[dict] = None
 
 
 class IngestResponse(BaseModel):
@@ -67,6 +89,53 @@ async def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    if req.mode == "agents":
+        return _ask_agents(req)
+    return _ask_basic(req)
+
+
+def _ask_agents(req: AskRequest) -> AskResponse:
+    """The multi-agent path.
+
+    Runs synchronously inside the request. Each model call takes seconds and
+    there are up to five of them, so this is slow by construction -- the
+    latency is the agent pattern's real cost, and hiding it behind a
+    background task would only hide it from the person measuring it.
+    """
+    from agents.graph import ask as agent_ask
+
+    result = agent_ask(req.question, with_critic=req.with_critic)
+
+    citations = [
+        Citation(
+            title=c.get("title", "") or "Unknown",
+            url=c.get("url", "") or "",
+            date_published=None,
+            snippet=f"cited via {c.get('source', '')}",
+        )
+        for c in (result.get("citations") or [])
+    ]
+    return AskResponse(
+        answer=result.get("final_answer") or "",
+        citations=citations,
+        mode="agents",
+        route=result.get("route"),
+        route_reason=result.get("route_reason"),
+        agent_path=result.get("agent_path"),
+        sql_query=result.get("sql_query"),
+        sql_row_count=len(result.get("sql_result") or []) or None,
+        sql_attempts=len(result.get("sql_attempts") or []) or None,
+        revisions=result.get("revisions"),
+        critic_verdict=result.get("critic_verdict"),
+        critique=result.get("critique"),
+        trace_id=result.get("trace_id"),
+        duration_ms=result.get("duration_ms"),
+        usage=result.get("usage"),
+    )
+
+
+def _ask_basic(req: AskRequest):
+    """The original single-step RAG path, unchanged, as the eval baseline."""
     store = get_store()
     try:
         store.load()
@@ -95,7 +164,7 @@ async def ask(req: AskRequest):
         )
         for c in chunks
     ]
-    return AskResponse(answer=answer, citations=citations)
+    return AskResponse(answer=answer, citations=citations, mode="basic")
 
 
 @app.post("/ingest", response_model=IngestResponse)

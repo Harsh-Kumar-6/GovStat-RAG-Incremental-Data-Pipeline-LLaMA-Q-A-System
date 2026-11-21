@@ -1,0 +1,4 @@
+{
+  "_README": "List prices in USD per 1,000,000 tokens. Fill these in from https://ai.google.dev/pricing (Gemini) for the models you actually use. An unpriced model reports cost_usd=None rather than a fabricated figure. Note: 'output' must be the billed output, which on reasoning models includes thinking tokens.",
+  "_example": {"input_per_1m": 0.0, "output_per_1m": 0.0}
+}

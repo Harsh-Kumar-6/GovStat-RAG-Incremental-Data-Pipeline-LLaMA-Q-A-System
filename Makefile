@@ -1,4 +1,4 @@
-.PHONY: crawl parse etl index up down lint test clean help
+.PHONY: crawl parse etl tables index models smoke up down lint test clean help
 
 ## Run the full scraper crawl
 crawl:
@@ -11,6 +11,18 @@ parse:
 ## Run the ETL pipeline (transform + chunk + validate)
 etl:
 	python -m pipeline.run
+
+## Build typed SQL tables (cpi_state) from the parsed table JSON
+tables:
+	python -m pipeline.tables_to_sql
+
+## List the Gemini models this API key can reach (costs 1 API request)
+models:
+	python -m agents models
+
+## Prove the API key works with one minimal call (costs 1 API request)
+smoke:
+	python -m agents smoke
 
 ## Build the FAISS vector index
 index:
@@ -40,9 +52,9 @@ pull-model:
 
 ## Lint & format
 lint:
-	black scraper pipeline rag tests
-	isort scraper pipeline rag tests
-	mypy scraper pipeline rag
+	black scraper pipeline rag agents tests
+	isort scraper pipeline rag agents tests
+	mypy scraper pipeline rag agents
 
 ## Run tests
 test:

@@ -12,6 +12,10 @@ pyarrow>=16.0.0
 # sqlite3 is stdlib
 
 # ETL / NLP
+# NOTE: on Linux, `pip install torch` pulls ~2.5 GB of NVIDIA CUDA wheels that
+# are useless for CPU inference. Install the CPU build first:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+# then install this file. The CPU wheel is ~900 MB instead.
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
 
@@ -28,8 +32,8 @@ streamlit>=1.35.0
 structlog>=24.1.0
 
 # Agents (Phase 2)
-langgraph>=0.2.0
-langchain-core>=0.3.0
+langgraph>=1.0.0
+langchain-core>=1.0.0
 google-genai>=1.0.0
 
 # Typing/QA

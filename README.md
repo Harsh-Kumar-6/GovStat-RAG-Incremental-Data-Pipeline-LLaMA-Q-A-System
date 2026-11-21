@@ -50,6 +50,22 @@ mospi-rag/
 ├── pipeline/
 │   ├── etl.py         # Transform → chunk → validate → Parquet
 │   └── run.py         # python -m pipeline.run
+├── agents/             # Phase 2: the multi-agent layer
+│   ├── llm_provider.py # Gemini | Ollama, token counts, cache, request budget
+│   ├── state.py        # AgentState (LangGraph state + reducers)
+│   ├── supervisor.py   # Routes to sql / rag / both / neither
+│   ├── sql_agent.py    # ReAct loop: write SQL, run it, fix the error
+│   ├── sql_guard.py    # SELECT-only allowlist, 1 statement, LIMIT, timeout
+│   ├── schema_doc.py   # The schema description given to the SQL agent
+│   ├── rag_agent.py    # Wraps the FAISS store, returns citable passages
+│   ├── writer.py       # Composes the answer from evidence only
+│   ├── critic.py       # Verifies the draft; approve or revise
+│   ├── graph.py        # LangGraph wiring + the ask() entry point
+│   └── __main__.py     # CLI: models / smoke / ask
+├── tracing/
+│   ├── tracer.py       # Spans: agent path, tokens, latency, cost
+│   ├── pricing.py      # Cost from prices.json; None when unpriced
+│   └── prices.json     # Ships empty on purpose — see docs/schema.md
 ├── rag/
 │   ├── indexer.py     # FAISS vector store + SentenceTransformer
 │   ├── llm.py         # Ollama / LLaMA3 client (streaming + sync)
@@ -59,14 +75,20 @@ mospi-rag/
 │   ├── Dockerfile.scraper
 │   ├── Dockerfile.api
 │   └── Dockerfile.ui
-├── tests/              # 91 tests — pytest
+├── tests/              # 244 tests — pytest
 │   ├── conftest.py            # DB + PDF fixtures
 │   ├── test_crawl.py          # API client, categories, idempotency
 │   ├── test_parse.py          # PDF guard (HTML-as-200), extraction
 │   ├── test_chunker.py        # Chunk windows, overlap, termination
 │   ├── test_validator.py      # Validation + date normalization
 │   ├── test_db.py             # Schema, migration, read-only connection
-│   └── test_etl_integration.py # DB → chunks, end to end
+│   ├── test_etl_integration.py # DB → chunks, end to end
+│   ├── test_tables_to_sql.py  # Typed cpi_state normalization
+│   ├── test_llm_provider.py   # Cache, budget, retries, JSON repair
+│   ├── test_sql_guard.py      # Injection, CTE writes, ATTACH/PRAGMA
+│   ├── test_agents.py         # Routing, ReAct recovery, refusal, critic
+│   ├── test_graph.py          # Whole-graph paths, revision cap, tracing
+│   └── test_tracer.py         # Span nesting, failed spans, cost rollup
 ├── docs/
 │   └── schema.md       # SQL schema and the reason for each choice
 ├── data/
@@ -105,6 +127,28 @@ python -m pipeline.run
 ```
 
 ---
+
+### Agent commands (Phase 2)
+
+```bash
+# List the Gemini models this API key can reach (costs 1 API request).
+# Model IDs churn and Google no longer publishes per-model free-tier limits,
+# so nothing is hardcoded — discover, then set GEMINI_MODEL in .env.
+make models
+
+# Prove the key works, with token accounting (costs 1 API request)
+make smoke
+
+# Ask one question through the full graph
+python -m agents ask "Which state had the highest rural CPI inflation in September 2026?"
+
+# The same question without the critic — one of the Phase 3 eval configurations
+python -m agents ask --no-critic "..."
+```
+
+`ask` prints the route and the reason, the agent path, the SQL that ran, any
+ReAct retries, the critic's verdict, the citations, and the token/cost/request
+totals — not just the answer.
 
 ## Configuration
 
@@ -225,6 +269,67 @@ Returns `{"status": "ok", "model": "llama3"}`.
 4. Response streamed back with clickable source URLs
 
 ---
+
+## Multi-agent architecture (Phase 2)
+
+```
+question
+   |
+   v
+supervisor ──── decides the route, as structured JSON with a reason
+   ├── sql_agent ── schema -> SQL -> guard -> read-only query
+   │                on error, feeds the error back (max 3 attempts)   [ReAct]
+   └── rag_agent ── FAISS search, returns passages with title/URL/date
+   |
+   v
+writer ──── composes the answer from the SQL rows and passages only
+   |
+   v
+critic ──── checks every number against the evidence       [self-reflection]
+   |            revise -> back to writer (max 2 revisions)
+   v
+final answer + citations + the SQL that ran + trace id
+```
+
+Four question types, and what each costs:
+
+| Type | Example | Route | API requests |
+|---|---|---|---|
+| SQL | "Which state had the highest rural CPI inflation in September 2026?" | `["sql"]` | 4 |
+| RAG | "What does MoSPI say about the CPI base year revision?" | `["rag"]` | 3 |
+| Both | "How did Karnataka's inflation change, and what reason was given?" | `["sql","rag"]` | 4 |
+| Unanswerable | "What will GDP growth be in 2030?" | `[]` | **1** |
+
+The unanswerable case costs one request because the refusal is enforced in
+code, before the writer's model call, and the critic is skipped — there is no
+factual claim to verify.
+
+### The SQL guard
+
+LLM-written SQL is treated as untrusted code. Four independent layers:
+
+1. **Read-only connection** (`mode=ro`) — enforced by SQLite itself.
+2. **One statement only** — semicolons inside string literals don't false-positive.
+3. **An allowlist** of `SELECT` / `WITH`, not a denylist of `DROP|DELETE|UPDATE`.
+   A denylist misses `ATTACH DATABASE`, `PRAGMA`, `VACUUM`, `REINDEX`; an
+   allowlist fails closed on whatever wasn't anticipated. `WITH ... INSERT` is
+   legal SQLite, so the forbidden-verb check scans the whole statement.
+4. **Row limit and statement timeout** (via SQLite's progress handler) — a
+   cartesian join written in good faith hangs a request as effectively as an
+   attack.
+
+### Cost and rate limits
+
+- Responses are cached on disk by `hash(provider, model, prompt, system,
+  temperature, json_mode)`. A repeated question costs 0 requests, which is what
+  makes a 45-question eval suite re-runnable against a daily free-tier limit.
+- `LLM_MAX_REQUESTS_PER_RUN` (default 30) raises rather than silently
+  exhausting a quota mid-run.
+- Reasoning models report **thinking tokens** separately while billing them as
+  output. On a measured request they were 77% of billed output, so they are
+  counted; ignoring them understates cost roughly 4×.
+- `tracing/prices.json` ships empty, so cost is reported as `None` rather than
+  as a fabricated figure.
 
 ## Trade-offs & Assumptions
 

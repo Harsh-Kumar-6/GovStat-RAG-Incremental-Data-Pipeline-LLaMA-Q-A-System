@@ -157,3 +157,98 @@ occupies the header row, real column labels are spread across three merged
 rows, and there are empty spacer columns (`col_2`, `col_5`). Each IIP
 statement needs its own normalizer. CPI was done first because it is clean and
 tells the same design story.
+
+---
+
+## Tracing tables (Phase 2)
+
+One request is a **trace**; one unit of work inside it is a **span**. The
+column names follow OpenTelemetry's model (`trace_id`, `span_id`, `parent_id`),
+so these tables can be exported to a real tracing backend later without
+changing how the code is instrumented.
+
+### `traces`
+
+| Column | Type | Notes |
+|---|---|---|
+| `trace_id` | TEXT PK | |
+| `question` | TEXT | |
+| `route` | TEXT | JSON array, e.g. `["sql","rag"]` |
+| `final_answer` | TEXT | Truncated to 4000 chars |
+| `ok` | INTEGER | 0 if any span failed |
+| `error` | TEXT | First failure |
+| `started_at` | TEXT | ISO-8601 UTC |
+| `duration_ms` | REAL | Wall clock for the whole request |
+| `n_spans` | INTEGER | |
+| `total_input_tokens` | INTEGER | |
+| `total_output_tokens` | INTEGER | Visible output only |
+| `total_thinking_tokens` | INTEGER | Reasoning tokens, billed as output |
+| `total_cost_usd` | REAL | **NULL when the model has no configured price** |
+
+`total_cost_usd` is nullable on purpose. `0` would read as "this was free";
+`NULL` means "the price is unknown". Prices live in `tracing/prices.json`,
+which ships empty so that no cost figure here is ever fabricated.
+
+`total_thinking_tokens` is separate because current reasoning models report it
+separately while billing it as output. On a measured request it was 77% of
+billed output, so a cost calculation that ignores it is wrong by roughly 4×.
+
+### `spans`
+
+| Column | Type | Notes |
+|---|---|---|
+| `span_id` | TEXT PK | |
+| `trace_id` | TEXT | → `traces.trace_id` |
+| `parent_id` | TEXT | NULL at the top level |
+| `name` | TEXT | `supervisor`, `sql_agent`, `rag_agent`, `writer`, `critic` |
+| `kind` | TEXT | `agent`, `llm`, `tool` |
+| `started_at` | TEXT | |
+| `duration_ms` | REAL | |
+| `ok` / `error` | INTEGER / TEXT | Failed spans are recorded, not dropped |
+| `model` | TEXT | |
+| `input_tokens`, `output_tokens`, `thinking_tokens` | INTEGER | |
+| `cost_usd` | REAL | NULL when unpriced |
+| `cached` | INTEGER | 1 when served from the response cache |
+| `attributes` | TEXT | JSON: route, row counts, retrieved doc ids |
+
+Indexes: `idx_spans_trace`, `idx_spans_name`, `idx_traces_start`.
+
+The `agent`-kind spans in `started_at` order **are** the agent path. Nothing
+reports the path separately, which is why routing accuracy in Phase 3 is a
+query over this table rather than extra bookkeeping in the graph.
+
+### Queries these tables are for
+
+```sql
+-- Latency by agent, which is where to look first when a request is slow
+SELECT name,
+       COUNT(*)                AS calls,
+       ROUND(AVG(duration_ms)) AS avg_ms,
+       ROUND(MAX(duration_ms)) AS max_ms
+FROM spans WHERE kind = 'agent'
+GROUP BY name ORDER BY avg_ms DESC;
+
+-- How often each route is chosen
+SELECT route, COUNT(*) FROM traces GROUP BY route ORDER BY 2 DESC;
+
+-- Requests where the critic sent the draft back
+SELECT t.question, s.attributes
+FROM spans s JOIN traces t ON t.trace_id = s.trace_id
+WHERE s.name = 'critic' AND s.attributes LIKE '%"verdict": "revise"%';
+
+-- Token split, including the reasoning tokens that dominate the bill
+SELECT SUM(total_input_tokens)    AS input,
+       SUM(total_output_tokens)   AS visible_output,
+       SUM(total_thinking_tokens) AS thinking
+FROM traces;
+
+-- Cache effectiveness: spans served without spending quota
+SELECT cached, COUNT(*) FROM spans WHERE kind = 'agent' GROUP BY cached;
+```
+
+## Not yet built
+
+- `iip` — Index of Industrial Production. The source tables need a per-statement
+  normalizer (statement title in the header row, labels spread over three merged
+  rows, empty spacer columns).
+- `gdp_quarterly`, `plfs` — same reason.

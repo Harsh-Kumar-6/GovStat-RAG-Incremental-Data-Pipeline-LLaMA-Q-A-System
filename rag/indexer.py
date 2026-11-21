@@ -41,11 +41,19 @@ class VectorStore:
 
         model = self._get_model()
         texts = df["text"].tolist()
-        embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
+        # normalize_embeddings=True + IndexFlatIP = cosine similarity.
+        # all-MiniLM-L6-v2 is trained with a cosine objective, so cosine is the
+        # metric it was optimised for; raw L2 on unnormalized vectors lets
+        # vector magnitude (which tracks chunk length, not meaning) influence
+        # the ranking. It also makes `score` mean "higher is better" in [-1, 1],
+        # which is what MRR and recall@k in Phase 3 expect.
+        embeddings = model.encode(
+            texts, show_progress_bar=True, batch_size=64, normalize_embeddings=True
+        )
         embeddings = np.array(embeddings).astype("float32")
 
         dim = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dim)
+        self.index = faiss.IndexFlatIP(dim)
         self.index.add(embeddings)
 
         self.metadata = df[["id", "document_id", "text", "title", "url", "date_published", "category"]].to_dict("records")
@@ -73,14 +81,20 @@ class VectorStore:
         if self.index is None:
             self.load()
         model = self._get_model()
-        q_emb = model.encode([query]).astype("float32")
-        distances, indices = self.index.search(q_emb, k)
+        # The query must be normalized the same way the index was, or the
+        # inner product is not a cosine similarity.
+        q_emb = np.asarray(
+            model.encode([query], normalize_embeddings=True)
+        ).astype("float32")
+        scores, indices = self.index.search(q_emb, k)
         results = []
-        for dist, idx in zip(distances[0], indices[0]):
+        for score, idx in zip(scores[0], indices[0]):
             if idx < 0 or idx >= len(self.metadata):
                 continue
             meta = self.metadata[idx].copy()
-            meta["score"] = float(dist)
+            # Cosine similarity: higher is better, unlike the L2 distance this
+            # used to return. Ranking code must not be left assuming otherwise.
+            meta["score"] = float(score)
             results.append(meta)
         return results
 
